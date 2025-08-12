@@ -12,10 +12,30 @@ const Canvas = forwardRef(({ boardState, setBoardState, socket, user, connectedU
     const [lastPanPos, setLastPanPos] = useState({ x: 0, y: 0 });
     const [history, setHistory] = useState([[]]); // Array of element states for undo/redo
     const [historyPointer, setHistoryPointer] = useState(0);
+    const [shapeStart, setShapeStart] = useState(null);
+    const [selectedElementId, setSelectedElementId] = useState(null);
 
     useImperativeHandle(ref, () => canvasRef.current); // Expose canvas DOM element
 
     const { elements, zoom, pan, activeTool, color, fillColor, lineWidth } = boardState;
+
+    function isPointInElement(x, y, element) {
+        if (element.type === 'rectangle' || element.type === 'stickyNote') {
+            return (
+                x >= element.x &&
+                x <= element.x + element.width &&
+                y >= element.y &&
+                y <= element.y + element.height
+            );
+        } else if (element.type === 'circle') {
+            const cx = element.x + element.width / 2;
+            const cy = element.y + element.height / 2;
+            const radius = element.width / 2;
+            return Math.pow(x - cx, 2) + Math.pow(y - cy, 2) <= radius * radius;
+        }
+        // For path, you can add hit-testing if needed
+        return false;
+    }
 
     // Initialize Canvas and Context
     useEffect(() => {
@@ -110,11 +130,32 @@ const Canvas = forwardRef(({ boardState, setBoardState, socket, user, connectedU
                 ctx.fill();
                 ctx.stroke();
             }
+
+            if (element.id === selectedElementId) {
+                ctx.save();
+                ctx.strokeStyle = 'blue';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 5]);
+                ctx.beginPath();
+                if (element.type === 'rectangle' || element.type === 'stickyNote') {
+                    ctx.rect(element.x, element.y, element.width, element.height);
+                } else if (element.type === 'circle') {
+                    ctx.arc(
+                        element.x + element.width / 2,
+                        element.y + element.height / 2,
+                        element.width / 2,
+                        0, Math.PI * 2
+                    );
+                }
+                ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.restore();
+            }
             // Sticky notes are rendered as separate React components, not on canvas
         });
 
         ctx.restore();
-    }, [elements, zoom, pan, drawGrid]);
+    }, [elements, zoom, pan, drawGrid, selectedElementId]);
 
     // Draw whenever elements, zoom, or pan change
     useEffect(() => {
@@ -170,8 +211,31 @@ const Canvas = forwardRef(({ boardState, setBoardState, socket, user, connectedU
         return { x, y };
     }, [pan, zoom]);
 
+    // Selection handler
+    const handleSelect = useCallback((e) => {
+        if (activeTool !== 'select') return;
+        const { x, y } = getCanvasCoordinates(e.clientX, e.clientY);
+        // Find topmost element under cursor
+        for (let i = elements.length - 1; i >= 0; i--) {
+            if (isPointInElement(x, y, elements[i])) {
+                setSelectedElementId(elements[i].id);
+                return;
+            }
+        }
+        setSelectedElementId(null);
+    }, [activeTool, elements, getCanvasCoordinates]);
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        canvas.addEventListener('mousedown', handleSelect);
+        return () => {
+            canvas.removeEventListener('mousedown', handleSelect);
+        };
+    }, [handleSelect]);
+
     // Mouse down handler
     const startDrawing = useCallback((e) => {
+        if (e.button !== 0) return;
         const { x, y } = getCanvasCoordinates(e.clientX, e.clientY);
         const ctx = contextRef.current;
 
@@ -204,6 +268,7 @@ const Canvas = forwardRef(({ boardState, setBoardState, socket, user, connectedU
             });
         } else if (activeTool === 'rectangle' || activeTool === 'circle') {
             setIsDrawing(true);
+            setShapeStart({ x, y });
             const newShapeId = uuidv4();
             setBoardState(prevState => ({
                 ...prevState,
@@ -239,7 +304,7 @@ const Canvas = forwardRef(({ boardState, setBoardState, socket, user, connectedU
             }));
             socket.emit('stickyNote', { boardId: boardState.boardId, ...newNote });
             saveStateToHistory([...elements, newNote]);
-            setBoardState(prevState => ({ ...prevState, activeTool: 'pencil' })); // Switch back to pencil
+            setBoardState(prevState => ({ ...prevState, activeTool: 'select' })); // Switch back to pencil
         }
     }, [activeTool, color, fillColor, lineWidth, setBoardState, socket, boardState.boardId, elements, getCanvasCoordinates, saveStateToHistory]);
 
@@ -268,27 +333,32 @@ const Canvas = forwardRef(({ boardState, setBoardState, socket, user, connectedU
                     currentPath.push({ x, y });
                     currentElement.path = JSON.stringify(currentPath);
                 } else if (activeTool === 'rectangle') {
-                    currentElement.width = x - currentElement.x;
-                    currentElement.height = y - currentElement.y;
+                    currentElement.x = Math.min(shapeStart.x, x);
+                    currentElement.y = Math.min(shapeStart.y, y);
+                    currentElement.width = Math.abs(x - shapeStart.x);
+                    currentElement.height = Math.abs(y - shapeStart.y);
                 } else if (activeTool === 'circle') {
-                    const radius = Math.sqrt(Math.pow(x - currentElement.x, 2) + Math.pow(y - currentElement.y, 2)) / 2;
+                    const dx = x - shapeStart.x;
+                    const dy = y - shapeStart.y;
+                    const radius = Math.sqrt(dx * dx + dy * dy);
+                    currentElement.x = shapeStart.x - radius; // Adjust x to be top-left of bounding box
+                    currentElement.y = shapeStart.y - radius; // Adjust y to be top-left of bounding box
                     currentElement.width = radius * 2; // Store diameter as width
                     currentElement.height = radius * 2; // Store diameter as height
-                    currentElement.x = currentElement.x + (x - currentElement.x) / 2 - radius; // Adjust x to be top-left of bounding box
-                    currentElement.y = currentElement.y + (y - currentElement.y) / 2 - radius; // Adjust y to be top-left of bounding box
                 }
 
                 socket.emit('drawing', { boardId: boardState.boardId, ...currentElement });
                 return { ...prevState, elements: updatedElements };
             });
         }
-    }, [isDrawing, activeTool, socket, boardState.boardId, setBoardState, getCanvasCoordinates, user]);
+    }, [isDrawing, activeTool, socket, boardState.boardId, setBoardState, getCanvasCoordinates, user, shapeStart]);
 
 
     // Mouse up handler
     const stopDrawing = useCallback(() => {
         if (isDrawing) {
             setIsDrawing(false);
+            setShapeStart(null);
             contextRef.current.closePath();
             // Save state to history only after a complete drawing action
             saveStateToHistory(boardState.elements);
@@ -297,7 +367,7 @@ const Canvas = forwardRef(({ boardState, setBoardState, socket, user, connectedU
 
     // Mouse Pan Controls
     const startPan = useCallback((e) => {
-        if (e.button === 1 || (e.button === 0 && activeTool === 'hand')) { // Middle click or 'hand' tool
+        if (e.button === 2 || activeTool === 'select') { // Middle click or 'hand' tool
             setIsPanning(true);
             setLastPanPos({ x: e.clientX, y: e.clientY });
             e.preventDefault(); // Prevent default drag behavior

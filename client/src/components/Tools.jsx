@@ -4,6 +4,12 @@ function Tools({ activeTool, setActiveTool, color, setColor, fillColor, setFillC
   return (
     <div className="tool-box">
       <button
+        className={activeTool === 'select' ? 'active' : ''}
+        onClick={() => setActiveTool('select')}
+      >
+        Select
+      </button>
+      <button
         className={activeTool === 'pencil' ? 'active' : ''}
         onClick={() => setActiveTool('pencil')}
       >
